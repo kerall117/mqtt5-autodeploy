@@ -19,10 +19,35 @@ MQTT_PORT=${MQTT_PORT:-1883}
 read -p "Enter port for MQTT WebSockets (default 9883): " WS_PORT
 WS_PORT=${WS_PORT:-9883}
 
-read -p "Enter Portainer API URL (e.g. http://localhost:9000/api): " PORTAINER_URL
-read -p "Enter Portainer API Key: " PORTAINER_API
+read -p "Enter Portainer API URL (default https://localhost:9443/api): " PORTAINER_URL
+PORTAINER_URL=${PORTAINER_URL:-https://localhost:9443/api}
+read -p "Enter Portainer Access Token: " PORTAINER_TOKEN
 read -p "Enter Stack Name [mqtt5]: " STACK_NAME
 STACK_NAME=${STACK_NAME:-mqtt5}
+
+# Fetch endpoint list and let user choose one
+ENDPOINTS=$(curl -sk -H "X-API-Key: $PORTAINER_TOKEN" "$PORTAINER_URL/endpoints")
+ENDPOINT_LIST=$(echo "$ENDPOINTS" | jq -r '.[] | "[\(.Id)] \(.Name)"')
+echo "Available Portainer Endpoints:"
+echo "$ENDPOINT_LIST"
+
+read -p "Enter Endpoint ID to deploy to: " ENDPOINT_ID
+
+# Validate Endpoint ID
+if ! echo "$ENDPOINTS" | jq -e ".[] | select(.Id == $ENDPOINT_ID)" > /dev/null; then
+  echo "❌ Invalid Endpoint ID: $ENDPOINT_ID does not exist."
+  exit 1
+fi
+
+# Check Portainer API availability
+echo -n "🔍 Checking Portainer availability... "
+if ! curl -ks -H "X-API-Key: $PORTAINER_TOKEN" "$PORTAINER_URL/status" &>/dev/null; then
+  echo "❌ FAILED"
+  echo "Cannot reach Portainer API at $PORTAINER_URL. Please check the URL or your token."
+  exit 1
+fi
+
+echo "✅ Available"
 
 INSTALL_DIR=/opt/mqtt5
 sudo mkdir -p $INSTALL_DIR/config $INSTALL_DIR/data $INSTALL_DIR/log
@@ -80,8 +105,8 @@ services:
 EOF
 
 # Deploy via Portainer API with retry
-STACK_PAYLOAD=$(jq -n --arg name "$STACK_NAME" --argjson env "[]" --arg content "$(<docker-compose.yml)" \
-  '{Name: $name, StackFileContent: $content, Env: $env, Prune: true}')
+STACK_PAYLOAD=$(jq -n --arg name "$STACK_NAME" --argjson env "[]" --arg content "$(<docker-compose.yml)" --argjson endpoint_id "$ENDPOINT_ID" \
+  '{Name: $name, StackFileContent: $content, Env: $env, Prune: true, EndpointId: $endpoint_id | tonumber}')
 
 MAX_RETRIES=3
 RETRY_DELAY=5
@@ -91,9 +116,9 @@ while [ $TRY -le $MAX_RETRIES ]; do
   echo "🔄 Attempt $TRY to deploy stack..." | tee -a "$LOG_FILE"
   echo "$STACK_PAYLOAD" > stack_payload.json
 
-  RESPONSE=$(curl -s -w "HTTP_CODE:%{http_code}" -o response.log -X POST "$PORTAINER_URL/stacks" \
+  RESPONSE=$(curl -sk -w "HTTP_CODE:%{http_code}" -o response.log -X POST "$PORTAINER_URL/endpoints/$ENDPOINT_ID/stacks" \
     -H "Content-Type: application/json" \
-    -H "X-API-Key: $PORTAINER_API" \
+    -H "X-API-Key: $PORTAINER_TOKEN" \
     -d @stack_payload.json)
 
   CODE=$(echo "$RESPONSE" | sed -n 's/.*HTTP_CODE://p')
@@ -102,7 +127,7 @@ while [ $TRY -le $MAX_RETRIES ]; do
   echo "Response code: $CODE" >> "$LOG_FILE"
 
   if [[ "$CODE" == "200" || "$CODE" == "201" ]]; then
-    echo -e "✅ MQTT5 configured and deployed to Portainer as stack '$STACK_NAME'." | tee -a "$LOG_FILE"
+    echo -e "✅ MQTT5 configured and deployed to Portainer (Endpoint $ENDPOINT_ID) as stack '$STACK_NAME'." | tee -a "$LOG_FILE"
     echo -e "📦 You can now manage it via the Portainer UI."
     exit 0
   else
